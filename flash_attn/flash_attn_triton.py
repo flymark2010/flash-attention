@@ -74,6 +74,7 @@ def _fwd_kernel(
     stride_bb, stride_bh, stride_bm,
     stride_ob, stride_oh, stride_om,
     nheads, seqlen_q, seqlen_k, seqlen_q_rounded, headdim,
+    dropout_p, dropout_seed,
     CACHE_KEY_SEQLEN_Q, CACHE_KEY_SEQLEN_K,
     BIAS_TYPE: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
@@ -172,7 +173,16 @@ def _fwd_kernel(
             m_ij = tl.maximum(tl.max(qk, 1) * softmax_scale, lse_i)
             p = tl.exp(qk * softmax_scale - m_ij[:, None])
         l_ij = tl.sum(p, 1)
-
+        # dropout
+        if dropout_p > 0.0:
+            num_block_m = tl.cdiv(seqlen_q, BLOCK_M)
+            block_offset = off_hb * num_block_m + start_m # column major
+            rnd_index = tl.arange(0, BLOCK_M * BLOCK_N, dtype=tl.int32).reshape(BLOCK_M, BLOCK_N)
+            rnd_index = block_offset * BLOCK_M * BLOCK_N + rnd_index
+            random = tl.rand(dropout_seed, rnd_index)
+            x_keep = random > dropout_p
+            p = tl.where(x_keep, p / (1. - dropout_p), 0.0)
+        
         # scale acc_o
         acc_o_scale = tl.exp(m_i - m_ij)
 
@@ -288,6 +298,7 @@ def _bwd_kernel_one_col_block(
     stride_qm, stride_kn, stride_vn, stride_bm,
     stride_dom, stride_dqm, stride_dkn, stride_dvn,
     seqlen_q, seqlen_k, headdim,
+    dropout_p, dropout_seed,
     ATOMIC_ADD: tl.constexpr,
     BIAS_TYPE: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
@@ -392,6 +403,15 @@ def _bwd_kernel_one_col_block(
             p = tl.exp(qk * softmax_scale - lse_i[:, None])
         else:
             p = tl.exp(qk - lse_i[:, None])
+        # dropout
+        if dropout_p > 0.0:
+            block_offset = start_n * num_block_m + tl.cdiv(start_m, BLOCK_M) # column major
+            rnd_index = tl.arange(0, BLOCK_M * BLOCK_N, dtype=tl.int32).reshape(BLOCK_M, BLOCK_N)
+            rnd_index = block_offset * BLOCK_M * BLOCK_N + rnd_index
+            random = tl.rand(dropout_seed, rnd_index)
+            x_keep = random > dropout_p
+            p = tl.where(x_keep, p / (1. - dropout_p), 0.0)
+
         # compute dv
         # [2022-10-30] TD: A Triton bug: if EVEN_M=True and EVEN_HEADDIM=False, if we call
         # do = tl.load(do_ptrs, mask=offs_d[None, :] < headdim, other=0.0), we get wrong outputs
@@ -422,6 +442,9 @@ def _bwd_kernel_one_col_block(
         if not (EVEN_M & EVEN_HEADDIM):
             tl.debug_barrier()
         dp = tl.dot(do, v, trans_b=True)
+        # dropout
+        if dropout_p > 0.0:
+            dp = tl.where(x_keep, dp / (1. - dropout_p), 0.0)
         # There's a race condition for headdim=48
         if not EVEN_HEADDIM:
             tl.debug_barrier()
@@ -518,6 +541,7 @@ def _bwd_kernel(
     stride_dkb, stride_dkh, stride_dkn,
     stride_dvb, stride_dvh, stride_dvn,
     nheads, seqlen_q, seqlen_k, seqlen_q_rounded, headdim,
+    dropout_p, dropout_seed,
     CACHE_KEY_SEQLEN_Q, CACHE_KEY_SEQLEN_K,
     BIAS_TYPE: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
@@ -553,7 +577,7 @@ def _bwd_kernel(
                 softmax_scale,
                 stride_qm, stride_kn, stride_vn, stride_bm,
                 stride_dom, stride_dqm, stride_dkn, stride_dvn,
-                seqlen_q, seqlen_k, headdim,
+                seqlen_q, seqlen_k, headdim, dropout_p, dropout_seed,
                 ATOMIC_ADD=False,
                 BIAS_TYPE=BIAS_TYPE,
                 IS_CAUSAL=IS_CAUSAL,
@@ -571,7 +595,7 @@ def _bwd_kernel(
             softmax_scale,
             stride_qm, stride_kn, stride_vn, stride_bm,
             stride_dom, stride_dqm, stride_dkn, stride_dvn,
-            seqlen_q, seqlen_k, headdim,
+            seqlen_q, seqlen_k, headdim, dropout_p, dropout_seed,
             ATOMIC_ADD=True,
             BIAS_TYPE=BIAS_TYPE,
             IS_CAUSAL=IS_CAUSAL,
@@ -581,7 +605,7 @@ def _bwd_kernel(
         )
 
 
-def _flash_attn_forward(q, k, v, bias=None, causal=False, softmax_scale=None):
+def _flash_attn_forward(q, k, v, bias=None, causal=False, softmax_scale=None, dropout_prob=0.0, dropout_seed=0):
     # shape constraints
     batch, seqlen_q, nheads, d = q.shape
     _, seqlen_k, _, _ = k.shape
@@ -630,6 +654,7 @@ def _flash_attn_forward(q, k, v, bias=None, causal=False, softmax_scale=None):
         *bias_strides,
         o.stride(0), o.stride(2), o.stride(1),
         nheads, seqlen_q, seqlen_k, seqlen_q_rounded, d,
+        dropout_prob, dropout_seed,
         seqlen_q // 32,  seqlen_k // 32, # key for triton cache (limit number of compilations)
         # Can't use kwargs here because triton autotune expects key to be args, not kwargs
         # IS_CAUSAL=causal, BLOCK_HEADDIM=d,
@@ -641,7 +666,7 @@ def _flash_attn_forward(q, k, v, bias=None, causal=False, softmax_scale=None):
     return o, lse, softmax_scale  # softmax_scale could have been updated
 
 
-def _flash_attn_backward(do, q, k, v, o, lse, dq, dk, dv, bias=None, causal=False, softmax_scale=None):
+def _flash_attn_backward(do, q, k, v, o, lse, dq, dk, dv, bias=None, causal=False, softmax_scale=None, dropout_prob=0.0, dropout_seed=0):
     # Make sure that the last dimension is contiguous
     if do.stride(-1) != 1:
         do = do.contiguous()
@@ -705,6 +730,7 @@ def _flash_attn_backward(do, q, k, v, o, lse, dq, dk, dv, bias=None, causal=Fals
         dk.stride(0), dk.stride(2), dk.stride(1),
         dv.stride(0), dv.stride(2), dv.stride(1),
         nheads, seqlen_q, seqlen_k, seqlen_q_rounded, d,
+        dropout_prob, dropout_seed,
         seqlen_q // 32,  seqlen_k // 32, # key for triton cache (limit number of compilations)
         # Can't use kwargs here because triton autotune expects key to be args, not kwargs
         # IS_CAUSAL=causal, BLOCK_HEADDIM=d,
@@ -720,22 +746,28 @@ def _flash_attn_backward(do, q, k, v, o, lse, dq, dk, dv, bias=None, causal=Fals
 class FlashAttnQKVPackedFunc(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, qkv, bias=None, causal=False, softmax_scale=None):
+    def forward(ctx, qkv, bias=None, causal=False, softmax_scale=None, attention_dropout=0.0):
         """
             qkv: (batch, seqlen, 3, nheads, headdim)
             bias: optional, shape broadcastible to (batch, nheads, seqlen, seqlen).
                 For example, ALiBi mask for causal would have shape (1, nheads, 1, seqlen).
                 ALiBi mask for non-causal would have shape (1, nheads, seqlen, seqlen)
         """
+        assert attention_dropout >= 0.0 and attention_dropout < 1.0, \
+            "dropout probability has to be between 0 and 1, but got {}".format(attention_dropout)
         # Make sure that the last dimension is contiguous
         if qkv.stride(-1) != 1:
             qkv = qkv.contiguous()
+        seed = torch.randint(0, 2**32, (1,)).item()
         o, lse, ctx.softmax_scale = _flash_attn_forward(
             qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2], bias=bias, causal=causal,
-            softmax_scale=softmax_scale
+            softmax_scale=softmax_scale, dropout_prob=attention_dropout,
+            dropout_seed=seed
         )
         ctx.save_for_backward(qkv, o, lse, bias)
         ctx.causal = causal
+        ctx.attention_dropout = attention_dropout
+        ctx.seed = seed
         return o
 
     @staticmethod
@@ -748,7 +780,8 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
             dqkv = torch.empty_like(qkv)
             _flash_attn_backward(do, qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2], o, lse,
                                  dqkv[:, :, 0], dqkv[:, :, 1], dqkv[:, :, 2],
-                                 bias=bias, causal=ctx.causal, softmax_scale=ctx.softmax_scale)
+                                 bias=bias, causal=ctx.causal, softmax_scale=ctx.softmax_scale,
+                                 dropout_prob=ctx.attention_dropout, dropout_seed=ctx.seed)
         return dqkv, None, None, None
 
 
@@ -758,7 +791,7 @@ flash_attn_qkvpacked_func = FlashAttnQKVPackedFunc.apply
 class FlashAttnKVPackedFunc(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, q, kv, bias=None, causal=False, softmax_scale=None):
+    def forward(ctx, q, kv, bias=None, causal=False, softmax_scale=None, attention_dropout=0.0):
         """
             q: (batch, seqlen_q, nheads, headdim)
             kv: (batch, seqlen_k, 2, nheads, headdim)
@@ -766,13 +799,19 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
                 For example, ALiBi mask for causal would have shape (1, nheads, 1, seqlen_k).
                 ALiBi mask for non-causal would have shape (1, nheads, seqlen_q, seqlen_k)
         """
+        assert attention_dropout >= 0.0 and attention_dropout < 1.0, \
+            "dropout probability has to be between 0 and 1, but got {}".format(attention_dropout)
         # Make sure that the last dimension is contiguous
         q, kv = [x if x.stride(-1) == 1 else x.contiguous() for x in [q, kv]]
+        seed = torch.randint(0, 2**32, (1,)).item()
         o, lse, ctx.softmax_scale = _flash_attn_forward(
-            q, kv[:, :, 0], kv[:, :, 1], bias=bias, causal=causal, softmax_scale=softmax_scale
+            q, kv[:, :, 0], kv[:, :, 1], bias=bias, causal=causal, softmax_scale=softmax_scale,
+            dropout_prob=attention_dropout, dropout_seed=seed
         )
         ctx.save_for_backward(q, kv, o, lse, bias)
         ctx.causal = causal
+        ctx.attention_dropout = attention_dropout
+        ctx.seed = seed
         return o
 
     @staticmethod
@@ -787,7 +826,8 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
             dkv = torch.empty_like(kv)
             _flash_attn_backward(do, q, kv[:, :, 0], kv[:, :, 1], o, lse,
                                  dq, dkv[:, :, 0], dkv[:, :, 1],
-                                 bias=bias, causal=ctx.causal, softmax_scale=ctx.softmax_scale)
+                                 bias=bias, causal=ctx.causal, softmax_scale=ctx.softmax_scale,
+                                 dropout_prob=ctx.attention_dropout, dropout_seed=ctx.seed)
         return dq, dkv, None, None, None
 
 
@@ -797,7 +837,7 @@ flash_attn_kvpacked_func = FlashAttnKVPackedFunc.apply
 class FlashAttnFunc(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, q, k, v, bias=None, causal=False, softmax_scale=None):
+    def forward(ctx, q, k, v, bias=None, causal=False, softmax_scale=None, attention_dropout=0.0):
         """
             q: (batch_size, seqlen_q, nheads, headdim)
             k, v: (batch_size, seqlen_k, nheads, headdim)
@@ -805,13 +845,19 @@ class FlashAttnFunc(torch.autograd.Function):
                 For example, ALiBi mask for causal would have shape (1, nheads, 1, seqlen_k).
                 ALiBi mask for non-causal would have shape (1, nheads, seqlen_q, seqlen_k)
         """
+        assert attention_dropout >= 0.0 and attention_dropout < 1.0, \
+            "dropout probability has to be between 0 and 1, but got {}".format(attention_dropout)
         # Make sure that the last dimension is contiguous
         q, k, v = [x if x.stride(-1) == 1 else x.contiguous() for x in [q, k, v]]
+        seed = torch.randint(0, 2**32, (1,)).item()
         o, lse, ctx.softmax_scale = _flash_attn_forward(
-            q, k, v, bias=bias, causal=causal, softmax_scale=softmax_scale
+            q, k, v, bias=bias, causal=causal, softmax_scale=softmax_scale,
+            dropout_prob=attention_dropout, dropout_seed=seed
         )
         ctx.save_for_backward(q, k, v, o, lse, bias)
         ctx.causal = causal
+        ctx.attention_dropout = attention_dropout
+        ctx.seed = seed
         return o
 
     @staticmethod
@@ -825,7 +871,8 @@ class FlashAttnFunc(torch.autograd.Function):
             dk = torch.empty_like(k)
             dv = torch.empty_like(v)
             _flash_attn_backward(do, q, k, v, o, lse, dq, dk, dv,
-                                 bias=bias, causal=ctx.causal, softmax_scale=ctx.softmax_scale)
+                                 bias=bias, causal=ctx.causal, softmax_scale=ctx.softmax_scale,
+                                 dropout_prob=ctx.attention_dropout, dropout_seed=ctx.seed)
         return dq, dk, dv, None, None, None
 
 
